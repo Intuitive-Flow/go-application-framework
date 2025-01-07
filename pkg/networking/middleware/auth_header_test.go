@@ -1,6 +1,7 @@
 package middleware_test
 
 import (
+	"fmt"
 	"net/http"
 	"net/url"
 	"testing"
@@ -15,7 +16,8 @@ import (
 )
 
 func Test_ShouldRequireAuthentication(t *testing.T) {
-	apiUrl, _ := api.GetCanonicalApiUrlFromString("https://api.au.snyk.io")
+	apiUrl, err := api.GetCanonicalApiUrlFromString("https://api.au.snyk.io")
+	assert.NoError(t, err)
 
 	cases := map[string]bool{
 		"https://app.au.snyk.io":                 true,
@@ -28,7 +30,8 @@ func Test_ShouldRequireAuthentication(t *testing.T) {
 	additionalSubdomains := []string{}
 
 	for u, expected := range cases {
-		requestUrl, _ := url.Parse(u)
+		requestUrl, err := url.Parse(u)
+		assert.NoError(t, err)
 		actual, err := middleware.ShouldRequireAuthentication(apiUrl, requestUrl, additionalSubdomains, additionalSubdomains)
 		assert.Nil(t, err)
 		assert.Equal(t, expected, actual)
@@ -36,7 +39,8 @@ func Test_ShouldRequireAuthentication(t *testing.T) {
 }
 
 func Test_ShouldRequireAuthentication_subdomains(t *testing.T) {
-	apiUrl, _ := api.GetCanonicalApiUrlFromString("https://api.eu.snyk.io")
+	apiUrl, err := api.GetCanonicalApiUrlFromString("https://api.eu.snyk.io")
+	assert.NoError(t, err)
 
 	cases := map[string]bool{
 		"https://mydomain.eu.snyk.io:443": true,
@@ -51,7 +55,8 @@ func Test_ShouldRequireAuthentication_subdomains(t *testing.T) {
 
 	for u, expected := range cases {
 		t.Run(u, func(t *testing.T) {
-			requestUrl, _ := url.Parse(u)
+			requestUrl, err := url.Parse(u)
+			assert.NoError(t, err)
 			actual, err := middleware.ShouldRequireAuthentication(apiUrl, requestUrl, additionalSubdomains, additionalUrls)
 			assert.Nil(t, err)
 			assert.Equal(t, expected, actual)
@@ -67,18 +72,20 @@ func Test_AddAuthenticationHeader(t *testing.T) {
 	config.Set(configuration.AUTHENTICATION_SUBDOMAINS, []string{"deeproxy"})
 
 	// case: headers added (api)
-	url, _ := url.Parse("https://app.snyk.io/rest/endpoint1")
+	url, err := url.Parse("https://app.snyk.io/rest/endpoint1")
+	assert.NoError(t, err)
 	request := &http.Request{
 		URL: url,
 	}
 
 	authenticator.EXPECT().AddAuthenticationHeader(request).Times(1)
 
-	err := middleware.AddAuthenticationHeader(authenticator, config, request)
-	assert.Nil(t, err)
+	err = middleware.AddAuthenticationHeader(authenticator, config, request)
+	assert.NoError(t, err)
 
 	// case: headers added (deeproxy)
-	url2, _ := url.Parse("https://deeproxy.snyk.io/rest/endpoint23")
+	url2, err := url.Parse("https://deeproxy.snyk.io/rest/endpoint23")
+	assert.NoError(t, err)
 	request2 := &http.Request{
 		URL: url2,
 	}
@@ -86,15 +93,33 @@ func Test_AddAuthenticationHeader(t *testing.T) {
 	authenticator.EXPECT().AddAuthenticationHeader(request2).Times(1)
 
 	err = middleware.AddAuthenticationHeader(authenticator, config, request2)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
 	// case: no headers added
-	url3, _ := url.Parse("https://app.au.snyk.io/rest/endpoint1")
+	url3, err := url.Parse("https://app.au.snyk.io/rest/endpoint1")
+	assert.NoError(t, err)
 	request3 := &http.Request{
 		URL: url3,
 	}
 
 	err = middleware.AddAuthenticationHeader(authenticator, config, request3)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
+}
 
+func TestAuthenticationError_Is(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	config := configuration.New()
+	config.Set(configuration.API_URL, "https://api.snyk.io")
+
+	url, err := url.Parse("https://app.snyk.io/rest/endpoint1")
+	assert.NoError(t, err)
+	request := &http.Request{
+		URL: url,
+	}
+
+	authenticator := mocks.NewMockAuthenticator(ctrl)
+	authenticator.EXPECT().AddAuthenticationHeader(gomock.Any()).Return(fmt.Errorf("nope"))
+	err = middleware.AddAuthenticationHeader(authenticator, config, request)
+	assert.ErrorIs(t, err, middleware.ErrAuthenticationFailed)
+	assert.ErrorContains(t, err, "nope")
 }

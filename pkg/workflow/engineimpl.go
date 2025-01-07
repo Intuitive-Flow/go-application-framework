@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 
 	"github.com/rs/zerolog"
 	zlog "github.com/rs/zerolog/log"
@@ -25,10 +26,12 @@ type EngineImpl struct {
 	analytics            analytics.Analytics
 	networkAccess        networking.NetworkAccess
 	initialized          bool
-	invocationCounter    int
 	logger               *zerolog.Logger
 	ui                   ui.UserInterface
 	runtimeInfo          runtimeinfo.RuntimeInfo
+
+	mu                sync.Mutex
+	invocationCounter int
 }
 
 var _ Engine = (*EngineImpl)(nil)
@@ -109,7 +112,10 @@ func NewDefaultWorkFlowEngine() Engine {
 func (e *EngineImpl) Init() error {
 	var err error
 
+	e.mu.Lock()
 	e.invocationCounter = 0
+	e.mu.Unlock()
+
 	_ = e.GetNetworkAccess()
 
 	for i := range e.extensionInitializer {
@@ -155,7 +161,7 @@ func (e *EngineImpl) Register(id Identifier, config ConfigurationOptions, entryP
 	}
 
 	if config == nil {
-		return nil, fmt.Errorf("Config must not be nil")
+		return nil, fmt.Errorf("config must not be nil")
 	}
 
 	if id == nil {
@@ -187,8 +193,12 @@ func (e *EngineImpl) GetWorkflows() []Identifier {
 	var result []Identifier
 
 	for k := range e.workflows {
-		tmp, _ := url.Parse(k)
-		result = append(result, tmp)
+		u, err := url.Parse(k)
+		if err != nil {
+			// a panic here is reasonable; how did we register an invalid URL in the first place?
+			panic(fmt.Sprintf("invalid workflow url: %q", k))
+		}
+		result = append(result, u)
 	}
 
 	return result
@@ -232,10 +242,13 @@ func (e *EngineImpl) InvokeWithInputAndConfig(
 	if ok {
 		callback := workflow.GetEntryPoint()
 		if callback != nil {
+			e.mu.Lock()
 			e.invocationCounter++
 
 			// prepare logger
 			prefix := fmt.Sprintf("%s:%d", id.Host, e.invocationCounter)
+			e.mu.Unlock()
+
 			zlogger := e.logger.With().Str("ext", prefix).Logger()
 
 			// prepare configuration
@@ -243,11 +256,17 @@ func (e *EngineImpl) InvokeWithInputAndConfig(
 				config = e.config.Clone()
 			}
 
+			// prepare networkAccess
+			networkAccess := e.networkAccess.Clone()
+			networkAccess.SetConfiguration(config)
+
 			// create a context object for the invocation
-			context := NewInvocationContext(id, config, e, e.networkAccess, zlogger, e.analytics, e.ui)
+			context := NewInvocationContext(id, config, e, networkAccess, zlogger, e.analytics, e.ui)
 
 			// invoke workflow through its callback
+			zlogger.Printf("Workflow Start")
 			output, err = callback(context, input)
+			zlogger.Printf("Workflow End")
 		}
 	} else {
 		err = fmt.Errorf("workflow '%v' not found", id)

@@ -1,6 +1,8 @@
 package networking
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -8,10 +10,13 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"testing"
 	"time"
 
+	"github.com/rs/zerolog"
+	"github.com/snyk/error-catalog-golang-public/snyk"
 	"github.com/snyk/go-httpauth/pkg/httpauth"
 	"github.com/stretchr/testify/assert"
 	"golang.org/x/oauth2"
@@ -23,7 +28,7 @@ import (
 )
 
 func getConfig() configuration.Configuration {
-	config := configuration.NewInMemory()
+	config := configuration.NewWithOpts(configuration.WithSupportedEnvVarPrefixes("snyk_"))
 	config.Set(configuration.API_URL, constants.SNYK_DEFAULT_API_URL)
 	config.Set(auth.CONFIG_KEY_OAUTH_TOKEN, "")
 	config.Set(configuration.AUTHENTICATION_TOKEN, "")
@@ -87,10 +92,11 @@ func Test_HttpClient_CallingApiUrl_UsesAuthHeaders_OAuth(t *testing.T) {
 		AccessToken:  accessToken,
 		TokenType:    "b",
 		RefreshToken: "c",
-		Expiry:       time.Now().Add(time.Duration(time.Minute * time.Duration(20))),
+		Expiry:       time.Now().Add(time.Minute * 20),
 	}
 
-	expectedTokenString, _ := json.Marshal(expectedToken)
+	expectedTokenString, err := json.Marshal(expectedToken)
+	assert.NoError(t, err)
 
 	expectedHeaders := map[string]string{
 		// deepcode ignore HardcodedPassword/test: <please specify a reason of ignoring this>
@@ -110,7 +116,7 @@ func Test_HttpClient_CallingApiUrl_UsesAuthHeaders_OAuth(t *testing.T) {
 	net := NewNetworkAccess(config)
 	client := net.GetHttpClient()
 
-	_, err := client.Get(server.URL)
+	_, err = client.Get(server.URL)
 	assert.NoError(t, err)
 }
 
@@ -150,14 +156,16 @@ func Test_HttpClient_CallingNonApiUrl(t *testing.T) {
 
 func Test_RoundTripper_SecureHTTPS(t *testing.T) {
 	config := getConfig()
-	net := NewNetworkAccess(config).(*networkImpl)
+	net, ok := NewNetworkAccess(config).(*networkImpl)
+	assert.True(t, ok)
 	transport := net.configureRoundTripper(http.DefaultTransport.(*http.Transport))
 	assert.False(t, transport.TLSClientConfig.InsecureSkipVerify)
 }
 
 func Test_RoundTripper_InsecureHTTPS(t *testing.T) {
 	config := getConfig()
-	net := NewNetworkAccess(config).(*networkImpl)
+	net, ok := NewNetworkAccess(config).(*networkImpl)
+	assert.True(t, ok)
 
 	config.Set(configuration.INSECURE_HTTPS, true)
 	transport := net.configureRoundTripper(http.DefaultTransport.(*http.Transport))
@@ -166,7 +174,8 @@ func Test_RoundTripper_InsecureHTTPS(t *testing.T) {
 
 func Test_RoundTripper_ProxyAuth(t *testing.T) {
 	config := getConfig()
-	net := NewNetworkAccess(config).(*networkImpl)
+	net, ok := NewNetworkAccess(config).(*networkImpl)
+	assert.True(t, ok)
 
 	// case: enable AnyAuth
 	config.Set(configuration.PROXY_AUTHENTICATION_MECHANISM, httpauth.StringFromAuthenticationMechanism(httpauth.AnyAuth))
@@ -202,27 +211,37 @@ func Test_GetHTTPClient_EmptyCAs(t *testing.T) {
 	config := getConfig()
 	config.Set(configuration.DEBUG, true)
 
-	certPem, _keyPem, _ := certs.MakeSelfSignedCert("mycert", []string{"localhost"}, log.Default())
-	certFile, _ := os.CreateTemp("", "")
-	_, err := certFile.Write(certPem)
-	assert.Nil(t, err)
+	certPem, _keyPem, err := certs.MakeSelfSignedCert("mycert", []string{"localhost"}, log.Default())
+	assert.NoError(t, err)
+	certFile, err := os.CreateTemp("", "")
+	assert.NoError(t, err)
+	_, err = certFile.Write(certPem)
+	assert.NoError(t, err)
 
-	keyFile, _ := os.CreateTemp("", "")
+	keyFile, err := os.CreateTemp("", "")
+	assert.NoError(t, err)
 	_, err = keyFile.Write(_keyPem)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
 	http.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
-		_, _ = io.WriteString(w, "Hello, TLS!\n")
+		_, err = io.WriteString(w, "Hello, TLS!\n")
+		assert.NoError(t, err)
 		fmt.Println("hello")
 	})
 
 	listenerReady := make(chan struct{})
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	assert.NoError(t, err)
+	t.Cleanup(func() {
+		listener.Close()
+	})
+
+	serverURL := fmt.Sprintf("https://localhost:%d/", listener.Addr().(*net.TCPAddr).Port)
 	listen := func() {
-		listener, err := net.Listen("tcp", ":8443")
-		assert.Nil(t, err)
 		listenerReady <- struct{}{} // Signal that listener is ready (using empty struct)
-		err = http.ServeTLS(listener, nil, certFile.Name(), keyFile.Name())
-		assert.Nil(t, err)
+		//nolint:gosec // client timeouts not a concern in tests
+		serveErr := http.ServeTLS(listener, nil, certFile.Name(), keyFile.Name())
+		t.Log("server stopped", serveErr)
 	}
 	go listen()
 
@@ -231,7 +250,7 @@ func Test_GetHTTPClient_EmptyCAs(t *testing.T) {
 	// test that we can't connect without adding the ca certificates
 	networkAccess := NewNetworkAccess(config)
 	client := networkAccess.GetHttpClient()
-	_, err = client.Get("https://localhost:8443/")
+	_, err = client.Get(serverURL)
 	assert.NotNil(t, err)
 
 	// invoke method under test
@@ -240,7 +259,7 @@ func Test_GetHTTPClient_EmptyCAs(t *testing.T) {
 
 	// test connectability after adding ca certificates
 	client = networkAccess.GetHttpClient()
-	_, err = client.Get("https://localhost:8443/")
+	_, err = client.Get(serverURL)
 	assert.Nil(t, err)
 }
 
@@ -249,21 +268,25 @@ func Test_AddHeaders_AddsDefaultAndAuthHeaders(t *testing.T) {
 		"Secret-Header": {"secret-value"},
 		"Authorization": {"Bearer MyToken"},
 		"Session-Token": {"Bearer MyToken"},
+		"Request-Id":    {"my-request"},
 	}
+
+	replaceableHeader := "I was here first"
 
 	config := getConfig()
 	config.Set(configuration.AUTHENTICATION_BEARER_TOKEN, "MyToken")
 	net := NewNetworkAccess(config)
 	net.AddHeaderField("secret-header", "secret-value")
+	net.AddDynamicHeaderField("request-id", func(values []string) []string {
+		assert.Equal(t, []string{replaceableHeader}, values)
+		return []string{"my-request"}
+	})
 
-	request, _ := http.NewRequest("GET", "https://api.snyk.io", nil)
-	err := net.AddHeaders(request)
-	assert.Nil(t, err)
-
-	keys := make([]string, 0, len(request.Header))
-	for k := range request.Header {
-		keys = append(keys, k)
-	}
+	request, err := http.NewRequest(http.MethodGet, "https://api.snyk.io", nil)
+	request.Header.Add("request-id", replaceableHeader)
+	assert.NoError(t, err)
+	err = net.AddHeaders(request)
+	assert.NoError(t, err)
 
 	assert.Equal(t, expectedHeader, request.Header)
 }
@@ -286,7 +309,7 @@ func Test_AddUserAgent_AddsUserAgentHeaderToSnykApiRequests(t *testing.T) {
 
 	config := getConfig()
 	net := NewNetworkAccess(config)
-	request, err := http.NewRequest("GET", "https://api.snyk.io", nil)
+	request, err := http.NewRequest(http.MethodGet, "https://api.snyk.io", nil)
 	assert.Nil(t, err)
 	userAgentInfo := UserAgentInfo{
 		App:                           app,
@@ -319,7 +342,7 @@ func Test_AddUserAgent_MissingIntegrationEnvironment_FormattedCorrectly(t *testi
 
 	config := getConfig()
 	net := NewNetworkAccess(config)
-	request, err := http.NewRequest("GET", "https://api.snyk.io", nil)
+	request, err := http.NewRequest(http.MethodGet, "https://api.snyk.io", nil)
 	assert.Nil(t, err)
 
 	userAgentInfo := UserAgentInfo{
@@ -348,7 +371,7 @@ func Test_AddUserAgent_NoIntegrationInfo_FormattedCorrectly(t *testing.T) {
 
 	config := getConfig()
 	net := NewNetworkAccess(config)
-	request, err := http.NewRequest("GET", "https://api.snyk.io", nil)
+	request, err := http.NewRequest(http.MethodGet, "https://api.snyk.io", nil)
 	assert.Nil(t, err)
 	t.Run("Without integration environment", func(t *testing.T) {
 		userAgentInfo := UserAgentInfo{
@@ -412,4 +435,126 @@ func Test_UserAgentInfo_Complete(t *testing.T) {
 	assert.Equal(t, expectedIntVersion, ua.IntegrationVersion)
 	assert.Equal(t, expectedIntEnvName, ua.IntegrationEnvironment)
 	assert.Equal(t, expectedIntEnvVersion, ua.IntegrationEnvironmentVersion)
+}
+
+func TestNetworkImpl_Clone(t *testing.T) {
+	config := configuration.NewWithOpts(configuration.WithAutomaticEnv())
+	network := NewNetworkAccess(config)
+
+	config2 := configuration.NewWithOpts(configuration.WithAutomaticEnv())
+	config2.Set(configuration.AUTHENTICATION_TOKEN, "test")
+	clonedNetwork := network.Clone()
+	clonedNetwork.SetConfiguration(config2)
+
+	url1, err := url.Parse("")
+	assert.NoError(t, err)
+	req1 := &http.Request{
+		Header: http.Header{},
+		URL:    url1,
+	}
+	req2 := &http.Request{
+		Header: http.Header{},
+		URL:    url1,
+	}
+
+	err = network.AddHeaders(req1)
+	assert.NoError(t, err)
+	err = clonedNetwork.AddHeaders(req2)
+	assert.NoError(t, err)
+
+	assert.NotEqual(t, req1, req2)
+	assert.NotEqual(t, network.GetConfiguration(), clonedNetwork.GetConfiguration())
+}
+
+func TestNetworkImpl_LogResponse_happyPath(t *testing.T) {
+	logBuffer := bytes.NewBuffer([]byte{})
+	logger := zerolog.New(logBuffer).Level(zerolog.DebugLevel)
+
+	expectedBody := "hello world"
+	request := &http.Request{}
+
+	response := &http.Response{}
+	response.Request = request
+	response.Header = http.Header{}
+	response.StatusCode = http.StatusBadGateway
+	response.Body = io.NopCloser(bytes.NewBufferString(expectedBody))
+
+	// invoke method under test
+	LogResponse(response, &logger)
+
+	actualLoggerContent := logBuffer.String()
+	assert.Contains(t, actualLoggerContent, "body: "+expectedBody)
+
+	// ensure the body is still existing after logging it
+	actualBody, err := io.ReadAll(response.Body)
+	assert.NoError(t, err)
+	assert.Equal(t, expectedBody, string(actualBody))
+
+	t.Log(actualLoggerContent)
+}
+
+func TestNetworkImpl_LogResponse_nolog(t *testing.T) {
+	logBuffer := bytes.NewBuffer([]byte{})
+	logger := zerolog.New(logBuffer).Level(zerolog.TraceLevel)
+
+	t.Run("nil response", func(t *testing.T) {
+		var response *http.Response
+
+		// invoke method under test
+		LogResponse(response, &logger)
+
+		actualLoggerContent := logBuffer.String()
+		assert.Empty(t, actualLoggerContent)
+	})
+
+	t.Run("non trace level logger", func(t *testing.T) {
+		response := &http.Response{}
+		nonTraceLogger := logger.Level(zerolog.InfoLevel)
+
+		// invoke method under test
+		LogResponse(response, &nonTraceLogger)
+
+		actualLoggerContent := logBuffer.String()
+		assert.Empty(t, actualLoggerContent)
+	})
+}
+
+func TestNetworkImpl_ErrorHandler(t *testing.T) {
+	expectedErr := snyk.NewUnauthorisedError("no auth")
+	config := configuration.NewWithOpts(configuration.WithAutomaticEnv())
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	})
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	t.Run("returns the error from the handler", func(t *testing.T) {
+		network := NewNetworkAccess(config)
+		network.AddErrorHandler(func(err error, ctx context.Context) error {
+			return expectedErr // overrides the previous error
+		})
+		client := network.GetHttpClient()
+		_, err := client.Get(server.URL)
+		assert.ErrorAs(t, err, &expectedErr)
+	})
+
+	t.Run("no error if the handler is not specified", func(t *testing.T) {
+		network := NewNetworkAccess(config)
+		network.AddErrorHandler(nil)
+		client := network.GetHttpClient()
+		res, err := client.Get(server.URL)
+		assert.Nil(t, err)
+		assert.Equal(t, res.StatusCode, http.StatusUnauthorized)
+	})
+
+	t.Run("unauthorized http client", func(t *testing.T) {
+		network := NewNetworkAccess(config)
+		network.AddErrorHandler(func(err error, ctx context.Context) error {
+			return expectedErr // overrides the previous error
+		})
+		client := network.GetUnauthorizedHttpClient()
+		_, err := client.Get(server.URL)
+		assert.ErrorAs(t, err, &expectedErr)
+	})
 }
