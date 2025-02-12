@@ -2,6 +2,7 @@ package analytics
 
 import (
 	"bytes"
+	//nolint:gosec // insecure sha1 used for legacy identifier
 	"crypto/sha1"
 	"encoding/json"
 	"errors"
@@ -9,7 +10,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"os/user"
 	"regexp"
 	"runtime"
@@ -19,7 +19,7 @@ import (
 	"github.com/hashicorp/go-uuid"
 
 	"github.com/snyk/go-application-framework/internal/api"
-	"github.com/snyk/go-application-framework/pkg/utils"
+	utils2 "github.com/snyk/go-application-framework/internal/utils"
 )
 
 // Analytics is an interface for managing analytics.
@@ -38,6 +38,7 @@ type Analytics interface {
 	GetOutputData() *analyticsOutput
 	GetRequest() (*http.Request, error)
 	Send() (*http.Response, error)
+	GetInstrumentation() InstrumentationCollector
 }
 
 // AnalyticsImpl is the default implementation of the Analytics interface.
@@ -55,6 +56,9 @@ type AnalyticsImpl struct {
 	integrationVersion string
 	os                 string
 	command            string
+	instrumentor       InstrumentationCollector
+
+	userCurrent func() (*user.User, error)
 }
 
 // metadataOutput defines the metadataOutput payload.
@@ -95,28 +99,6 @@ type dataOutput struct {
 }
 
 var (
-	// ciEnvironments is a list of environment variables that indicate a CI environment.
-	// it is used to determine if the command is running in a CI environment.
-	// if it is, the x-is-ci header is set to true.
-	ciEnvironments = []string{
-		"SNYK_CI",
-		"CI",
-		"CONTINUOUS_INTEGRATION",
-		"BUILD_ID",
-		"BUILD_NUMBER",
-		"TEAMCITY_VERSION",
-		"TRAVIS",
-		"CIRCLECI",
-		"JENKINS_URL",
-		"HUDSON_URL",
-		"bamboo.buildKey",
-		"PHPCI",
-		"GOCD_SERVER_HOST",
-		"BUILDKITE",
-		"TF_BUILD",
-		"SYSTEM_TEAMFOUNDATIONSERVERURI", // for Azure DevOps Pipelines
-	}
-
 	// sensitiveFieldNames is a list of field names that should be sanitized.
 	// data sanitization is used to prevent sensitive data from being sent to the analytics server.
 	sensitiveFieldNames = []string{
@@ -130,17 +112,21 @@ var (
 )
 
 const (
-	sanitize_replacement_string string = "REDACTED"
-	api_endpoint                       = "/v1/analytics/cli"
+	sanitizeReplacementString string = "REDACTED"
+	apiEndpoint               string = "/v1/analytics/cli"
 )
 
 // New creates a new Analytics instance.
 func New() Analytics {
-	a := &AnalyticsImpl{}
+	a := &AnalyticsImpl{
+		userCurrent: user.Current,
+	}
 	a.headerFunc = func() http.Header { return http.Header{} }
 	a.created = time.Now()
 	a.clientFunc = func() *http.Client { return &http.Client{} }
 	a.os = runtime.GOOS
+	a.instrumentor = NewInstrumentationCollector()
+	a.instrumentor.SetTimestamp(a.created)
 	return a
 }
 
@@ -181,6 +167,10 @@ func (a *AnalyticsImpl) SetOperatingSystem(os string) {
 // AddError adds an error to the error list.
 func (a *AnalyticsImpl) AddError(err error) {
 	a.errorList = append(a.errorList, err)
+
+	if a.instrumentor != nil {
+		a.instrumentor.AddError(err)
+	}
 }
 
 // AddHeader adds a header to the request.
@@ -195,17 +185,7 @@ func (a *AnalyticsImpl) SetClient(clientFunc func() *http.Client) {
 
 // IsCiEnvironment returns true if the command is running in a CI environment.
 func (a *AnalyticsImpl) IsCiEnvironment() bool {
-	result := false
-
-	envMap := utils.ToKeyValueMap(os.Environ(), "=")
-	for i := range ciEnvironments {
-		if _, ok := envMap[ciEnvironments[i]]; ok {
-			result = true
-			break
-		}
-	}
-
-	return result
+	return utils2.IsCiEnvironment()
 }
 
 // GetOutputData returns the analyticsOutput data.
@@ -221,12 +201,16 @@ func (a *AnalyticsImpl) GetOutputData() *analyticsOutput {
 	}
 
 	// deepcode ignore InsecureHash: It is just being used to generate an id, without any security concerns
+	//nolint:gosec // sha1 only used to generate an id
 	shasum := sha1.New()
+	//nolint:errcheck // breaking api change needed to fix this
 	uuid, _ := uuid.GenerateUUID()
+	//nolint:errcheck // breaking api change needed to fix this
 	io.WriteString(shasum, uuid)
 	output.Id = fmt.Sprintf("%x", shasum.Sum(nil))
 
-	output.Args = a.args
+	// CLI-586 - stop sending CLI args to analytics
+	output.Args = []string{}
 
 	if len(a.command) > 0 {
 		output.Command = a.command
@@ -241,7 +225,7 @@ func (a *AnalyticsImpl) GetOutputData() *analyticsOutput {
 	output.Ci = a.IsCiEnvironment()
 	output.IntegrationName = a.integrationName
 	output.IntegrationVersion = a.integrationVersion
-	output.DurationMs = int64(time.Since(a.created).Milliseconds())
+	output.DurationMs = time.Since(a.created).Milliseconds()
 	output.Standalone = true // standalone means binary deployment, which is always true for go applications.
 
 	return output
@@ -259,21 +243,24 @@ func (a *AnalyticsImpl) GetRequest() (*http.Request, error) {
 		return nil, err
 	}
 
-	outputJson, err = SanitizeValuesByKey(sensitiveFieldNames, sanitize_replacement_string, outputJson)
+	outputJson, err = SanitizeValuesByKey(sensitiveFieldNames, sanitizeReplacementString, outputJson)
 	if err != nil {
 		return nil, err
 	}
 
-	user, err := user.Current()
+	user, err := a.userCurrent()
 	if err != nil {
 		return nil, err
 	}
-	outputJson, err = SanitizeUsername(user.Username, user.HomeDir, sanitize_replacement_string, outputJson)
+	outputJson, err = SanitizeUsername(user.Username, user.HomeDir, sanitizeReplacementString, outputJson)
 	if err != nil {
 		return nil, err
 	}
 
-	analyticsUrl, _ := url.Parse(a.apiUrl + api_endpoint)
+	analyticsUrl, err := url.Parse(a.apiUrl + apiEndpoint)
+	if err != nil {
+		return nil, err
+	}
 	if len(a.org) > 0 {
 		query := url.Values{}
 		query.Add("org", a.org)
@@ -314,7 +301,11 @@ func (a *AnalyticsImpl) isEnabled() bool {
 	return !api.IsFedramp(a.apiUrl)
 }
 
-var DisabledInFedrampErr = errors.New("analytics are disabled in FedRAMP environments")
+func (a *AnalyticsImpl) GetInstrumentation() InstrumentationCollector {
+	return a.instrumentor
+}
+
+var DisabledInFedrampErr = errors.New("analytics are disabled in FedRAMP environments") //nolint:errname // breaking API change
 
 // This method sanitizes the given content by searching for key-value mappings. It thereby replaces all keys defined in keysToFilter by the replacement string
 // Supported patterns are:
