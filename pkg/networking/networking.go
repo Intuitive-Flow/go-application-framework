@@ -1,22 +1,30 @@
 package networking
 
 import (
+	"bytes"
 	"crypto/x509"
 	"io"
 	"net/http"
 	"net/url"
-	"strings"
 
 	"github.com/rs/zerolog"
+
 	"github.com/snyk/go-httpauth/pkg/httpauth"
 
 	"github.com/snyk/go-application-framework/pkg/auth"
 	"github.com/snyk/go-application-framework/pkg/configuration"
 	"github.com/snyk/go-application-framework/pkg/networking/certs"
 	"github.com/snyk/go-application-framework/pkg/networking/middleware"
+	networktypes "github.com/snyk/go-application-framework/pkg/networking/network_types"
 )
 
 //go:generate $GOPATH/bin/mockgen -source=networking.go -destination ../mocks/networking.go -package mocks -self_package github.com/snyk/go-application-framework/pkg/networking/
+
+type keyTypeString string
+
+// InteractionIdKey is the name to be used for any interaction ID keys
+// e.g. It should be used if setting the interaction ID into a context.Context
+const InteractionIdKey = keyTypeString("interactionId")
 
 // NetworkAccess is the interface for network access.
 // It provides methods to get an HTTP client with default behaviors that handle authentication headers for Snyk API calls.
@@ -31,8 +39,14 @@ type NetworkAccess interface {
 	GetUnauthorizedHttpClient() *http.Client
 	// AddHeaderField adds a header field to the default header.
 	AddHeaderField(key, value string)
+	// AddDynamicHeaderField adds a dynamic header field to the request.
+	AddDynamicHeaderField(key string, f DynamicHeaderFunc)
 	// AddRootCAs adds the root CAs from the given PEM file.
 	AddRootCAs(pemFileLocation string) error
+	// AddErrorHandler registers an error handler for the underlying http.RoundTripper.
+	AddErrorHandler(networktypes.ErrorHandlerFunc)
+	// GetErrorHandler returns the registered error handler.
+	GetErrorHandler() networktypes.ErrorHandlerFunc
 	// GetAuthenticator returns the authenticator.
 	GetAuthenticator() auth.Authenticator
 
@@ -40,62 +54,74 @@ type NetworkAccess interface {
 	SetConfiguration(configuration configuration.Configuration)
 	GetLogger() *zerolog.Logger
 	GetConfiguration() configuration.Configuration
+
+	Clone() NetworkAccess
 }
+
+type DynamicHeaderFunc func([]string) []string
 
 // networkImpl is the default implementation of the NetworkAccess interface.
 type networkImpl struct {
-	config       configuration.Configuration
-	staticHeader http.Header
-	proxy        func(req *http.Request) (*url.URL, error)
-	caPool       *x509.CertPool
-	logger       *zerolog.Logger
+	config         configuration.Configuration
+	staticHeader   http.Header
+	dynamicHeaders map[string]DynamicHeaderFunc
+	proxy          func(req *http.Request) (*url.URL, error)
+	errorHandler   networktypes.ErrorHandlerFunc
+	caPool         *x509.CertPool
+	logger         *zerolog.Logger
+}
+
+const defaultNetworkLogLevel = zerolog.DebugLevel
+
+func LogRequest(r *http.Request, logger *zerolog.Logger) {
+	if logger.GetLevel() > defaultNetworkLogLevel { // Don't log if logger level is above the threshold
+		return
+	}
+
+	logger.WithLevel(defaultNetworkLogLevel).Msgf("> request [%p]: %s %s", r, r.Method, r.URL.String())
+	logger.WithLevel(defaultNetworkLogLevel).Msgf("> request [%p]: header: %v", r, r.Header)
+}
+
+func LogResponse(response *http.Response, logger *zerolog.Logger) {
+	if logger.GetLevel() > defaultNetworkLogLevel { // Don't log if logger level is above the threshold
+		return
+	}
+
+	if response != nil {
+		logger.WithLevel(defaultNetworkLogLevel).Msgf("< response [%p]: %s", response.Request, response.Status)
+		logger.WithLevel(defaultNetworkLogLevel).Msgf("< response [%p]: header: %v", response.Request, response.Header)
+
+		// read body for error code
+		if response.StatusCode >= 400 {
+			bodyBytes, bodyErr := io.ReadAll(response.Body)
+			if bodyErr == nil {
+				response.Body.Close()
+				response.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+				logger.WithLevel(defaultNetworkLogLevel).Msgf("< response [%p]: body: %v", response.Request, string(bodyBytes))
+			} else {
+				logger.WithLevel(defaultNetworkLogLevel).Err(bodyErr).Msgf("< response [%p]: Failed to read response body", response.Request)
+			}
+		}
+	}
 }
 
 // defaultHeadersRoundTripper is a custom http.RoundTripper which decorates the request with default headers.
 type defaultHeadersRoundTripper struct {
 	encapsulatedRoundTripper http.RoundTripper
 	networkAccess            *networkImpl
+	logLevel                 zerolog.Level
 }
 
 func (rt *defaultHeadersRoundTripper) logRoundTrip(request *http.Request, response *http.Response, err error) {
-	loglevel := zerolog.TraceLevel
-
-	if rt.networkAccess == nil || rt.networkAccess.logger == nil || rt.networkAccess.logger.GetLevel() != loglevel {
+	if rt.networkAccess == nil || rt.networkAccess.logger == nil || rt.networkAccess.logger.GetLevel() != rt.logLevel {
 		return
 	}
 
-	logHeader := http.Header{}
-	for i, v := range request.Header {
-		for _, value := range v {
-			if strings.ToLower(i) == "authorization" || strings.ToLower(i) == "session-token" {
-				authHeader := strings.Split(value, " ")
-				if len(authHeader) == 2 && len(authHeader[1]) > 4 {
-					value = authHeader[0] + " " + authHeader[1][0:4] + "***"
-				} else {
-					value = "***"
-				}
-			}
-			logHeader.Add(i, value)
-		}
-	}
-
-	rt.networkAccess.logger.WithLevel(loglevel).Msgf("> request [%p]: %s %s", request, request.Method, request.URL.String())
-	rt.networkAccess.logger.WithLevel(loglevel).Msgf("> request [%p]: header: %v", request, logHeader)
-
-	if response != nil {
-		rt.networkAccess.logger.WithLevel(loglevel).Msgf("< response [%p]: %d %s", request, response.StatusCode, response.Status)
-		rt.networkAccess.logger.WithLevel(loglevel).Msgf("< response [%p]: header: %v", request, response.Header)
-
-		// read body for error code
-		if response.StatusCode < 200 || 299 < response.StatusCode {
-			if bodyBytes, err := io.ReadAll(response.Body); err == nil {
-				rt.networkAccess.logger.WithLevel(loglevel).Msgf("< response [%p]: body: %v", request, string(bodyBytes))
-			}
-		}
-	}
+	LogRequest(request, rt.networkAccess.logger)
+	LogResponse(response, rt.networkAccess.logger)
 
 	if err != nil {
-		rt.networkAccess.logger.WithLevel(loglevel).Msgf("< error: %s", err.Error())
+		rt.networkAccess.logger.WithLevel(rt.logLevel).Msgf("< error: %s", err.Error())
 	}
 }
 
@@ -110,16 +136,21 @@ func (rt *defaultHeadersRoundTripper) RoundTrip(request *http.Request) (*http.Re
 	return response, err
 }
 
+func (rt *defaultHeadersRoundTripper) SetLogLevel(level zerolog.Level) {
+	rt.logLevel = level
+}
+
 // NewNetworkAccess returns a networkImpl instance.
 func NewNetworkAccess(config configuration.Configuration) NetworkAccess {
 	// prepare logger
 	logger := zerolog.New(io.Discard)
 
 	n := &networkImpl{
-		config:       config,
-		staticHeader: http.Header{},
-		logger:       &logger,
-		proxy:        http.ProxyFromEnvironment,
+		config:         config,
+		staticHeader:   http.Header{},
+		logger:         &logger,
+		proxy:          http.ProxyFromEnvironment,
+		dynamicHeaders: map[string]DynamicHeaderFunc{},
 	}
 
 	extraCaCertFile := config.GetString(configuration.ADD_TRUSTED_CA_FILE)
@@ -135,8 +166,27 @@ func NewNetworkAccess(config configuration.Configuration) NetworkAccess {
 	return n
 }
 
+// AddHeaderField enables to set static header field values to requests. Existing values will be replaced.
+// For more flexibility, see AddDynamicHeaderField().
 func (n *networkImpl) AddHeaderField(key, value string) {
 	n.staticHeader.Add(key, value)
+}
+
+// AddErrorHandler registers an error handler for the underlying http.RoundTripper and registers the response middleware
+// that maps non 2xx status codes to Error Catalog errors.
+func (n *networkImpl) AddErrorHandler(handler networktypes.ErrorHandlerFunc) {
+	n.errorHandler = handler
+}
+
+func (n *networkImpl) GetErrorHandler() networktypes.ErrorHandlerFunc {
+	return n.errorHandler
+}
+
+// AddDynamicHeaderField enables to define functions that will be invoked when a header field is added to a request.
+// The function receives a string slice of existing values and should return the final values associated to the header field.
+// This function extends the possibilities that AddHeaderField() offers for static header fields.
+func (n *networkImpl) AddDynamicHeaderField(key string, f DynamicHeaderFunc) {
+	n.dynamicHeaders[key] = f
 }
 
 func (n *networkImpl) AddHeaders(request *http.Request) error {
@@ -146,6 +196,16 @@ func (n *networkImpl) AddHeaders(request *http.Request) error {
 
 // addDefaultHeader adds the default headers request.
 func (n *networkImpl) addDefaultHeader(request *http.Request) {
+	// add/replace request headers by dynamic headers
+	for k, determineHeader := range n.dynamicHeaders {
+		existingValues := request.Header.Values(k)
+		newValues := determineHeader(existingValues)
+		request.Header.Del(k)
+		for _, nv := range newValues {
+			request.Header.Add(k, nv)
+		}
+	}
+
 	// add/replace request headers by default headers
 	for k, v := range n.staticHeader {
 		request.Header.Del(k)
@@ -156,10 +216,16 @@ func (n *networkImpl) addDefaultHeader(request *http.Request) {
 }
 
 func (n *networkImpl) getUnauthorizedRoundTripper() http.RoundTripper {
-	transport := http.DefaultTransport.(*http.Transport)
+	//nolint:errcheck // breaking api change needed to fix this
+	transport := http.DefaultTransport.(*http.Transport) //nolint:forcetypeassert // panic here is reasonable
+	var crt http.RoundTripper = n.configureRoundTripper(transport)
+	if n.errorHandler != nil {
+		crt = middleware.NewReponseMiddleware(crt, n.config, n.errorHandler)
+	}
 	rt := defaultHeadersRoundTripper{
 		networkAccess:            n,
-		encapsulatedRoundTripper: n.configureRoundTripper(transport),
+		encapsulatedRoundTripper: crt,
+		logLevel:                 defaultNetworkLogLevel,
 	}
 	return &rt
 }
@@ -226,4 +292,25 @@ func (n *networkImpl) GetLogger() *zerolog.Logger {
 
 func (n *networkImpl) GetConfiguration() configuration.Configuration {
 	return n.config
+}
+
+func (n *networkImpl) Clone() NetworkAccess {
+	clone := &networkImpl{
+		config:         n.config.Clone(),
+		logger:         n.logger,
+		staticHeader:   n.staticHeader.Clone(),
+		dynamicHeaders: map[string]DynamicHeaderFunc{},
+		proxy:          n.proxy,
+		errorHandler:   n.errorHandler,
+	}
+
+	for key, dynHeaderFuncs := range n.dynamicHeaders {
+		clone.dynamicHeaders[key] = dynHeaderFuncs
+	}
+
+	if n.caPool != nil {
+		clone.caPool = n.caPool.Clone()
+	}
+
+	return clone
 }

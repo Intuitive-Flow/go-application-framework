@@ -12,6 +12,8 @@ import (
 	zerolog "github.com/rs/zerolog"
 	auth "github.com/snyk/go-application-framework/pkg/auth"
 	configuration "github.com/snyk/go-application-framework/pkg/configuration"
+	networking "github.com/snyk/go-application-framework/pkg/networking"
+	networktypes "github.com/snyk/go-application-framework/pkg/networking/network_types"
 )
 
 // MockNetworkAccess is a mock of NetworkAccess interface.
@@ -35,6 +37,30 @@ func NewMockNetworkAccess(ctrl *gomock.Controller) *MockNetworkAccess {
 // EXPECT returns an object that allows the caller to indicate expected use.
 func (m *MockNetworkAccess) EXPECT() *MockNetworkAccessMockRecorder {
 	return m.recorder
+}
+
+// AddDynamicHeaderField mocks base method.
+func (m *MockNetworkAccess) AddDynamicHeaderField(key string, f networking.DynamicHeaderFunc) {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "AddDynamicHeaderField", key, f)
+}
+
+// AddDynamicHeaderField indicates an expected call of AddDynamicHeaderField.
+func (mr *MockNetworkAccessMockRecorder) AddDynamicHeaderField(key, f interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "AddDynamicHeaderField", reflect.TypeOf((*MockNetworkAccess)(nil).AddDynamicHeaderField), key, f)
+}
+
+// AddErrorHandler mocks base method.
+func (m *MockNetworkAccess) AddErrorHandler(arg0 networktypes.ErrorHandlerFunc) {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "AddErrorHandler", arg0)
+}
+
+// AddErrorHandler indicates an expected call of AddErrorHandler.
+func (mr *MockNetworkAccessMockRecorder) AddErrorHandler(arg0 interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "AddErrorHandler", reflect.TypeOf((*MockNetworkAccess)(nil).AddErrorHandler), arg0)
 }
 
 // AddHeaderField mocks base method.
@@ -77,6 +103,20 @@ func (mr *MockNetworkAccessMockRecorder) AddRootCAs(pemFileLocation interface{})
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "AddRootCAs", reflect.TypeOf((*MockNetworkAccess)(nil).AddRootCAs), pemFileLocation)
 }
 
+// Clone mocks base method.
+func (m *MockNetworkAccess) Clone() networking.NetworkAccess {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "Clone")
+	ret0, _ := ret[0].(networking.NetworkAccess)
+	return ret0
+}
+
+// Clone indicates an expected call of Clone.
+func (mr *MockNetworkAccessMockRecorder) Clone() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Clone", reflect.TypeOf((*MockNetworkAccess)(nil).Clone))
+}
+
 // GetAuthenticator mocks base method.
 func (m *MockNetworkAccess) GetAuthenticator() auth.Authenticator {
 	m.ctrl.T.Helper()
@@ -103,6 +143,20 @@ func (m *MockNetworkAccess) GetConfiguration() configuration.Configuration {
 func (mr *MockNetworkAccessMockRecorder) GetConfiguration() *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetConfiguration", reflect.TypeOf((*MockNetworkAccess)(nil).GetConfiguration))
+}
+
+// GetErrorHandler mocks base method.
+func (m *MockNetworkAccess) GetErrorHandler() networktypes.ErrorHandlerFunc {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetErrorHandler")
+	ret0, _ := ret[0].(networktypes.ErrorHandlerFunc)
+	return ret0
+}
+
+// GetErrorHandler indicates an expected call of GetErrorHandler.
+func (mr *MockNetworkAccessMockRecorder) GetErrorHandler() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetErrorHandler", reflect.TypeOf((*MockNetworkAccess)(nil).GetErrorHandler))
 }
 
 // GetHttpClient mocks base method.
