@@ -6,8 +6,9 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/snyk/go-application-framework/pkg/configuration"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/snyk/go-application-framework/pkg/configuration"
 )
 
 const key = "someKey"
@@ -23,19 +24,23 @@ func Test_JsonStorage_Set_NoConfigFile(t *testing.T) {
 		{
 			setup: "File does not exist",
 			customSetupFunc: func(t *testing.T) string {
+				t.Helper()
 				return filepath.Join(t.TempDir(), "test.json")
 			},
 		},
 		{
 			setup: "Leading folders to the file do not exist",
 			customSetupFunc: func(t *testing.T) string {
+				t.Helper()
 				return filepath.Join(t.TempDir(), "nonexistent", "test.json")
 			},
 		},
 	}
 
-	for _, testCase := range testCases {
+	for i := range testCases {
+		testCase := testCases[i]
 		t.Run(testCase.setup+" - config file is created", func(t *testing.T) {
+			t.Parallel()
 			configFile := testCase.customSetupFunc(t)
 			storage := configuration.NewJsonStorage(configFile)
 
@@ -50,7 +55,7 @@ func Test_JsonStorage_Set_NoConfigFile(t *testing.T) {
 	}
 }
 
-func Test_JsonStorage_Set_ConfigFileHasValues(t *testing.T) {
+func Test_JsonStorage_Set_ConfigFileHasValues(t *testing.T) { //nolint:tparallel // subtests are not mutually exclusive
 	// Arrange
 	t.Parallel()
 	const preExistingKey = "someOtherKey"
@@ -60,15 +65,16 @@ func Test_JsonStorage_Set_ConfigFileHasValues(t *testing.T) {
 		preExistingKey: preExistingValue,
 	}
 
-	unknownJson, _ := json.Marshal(preExistingConfig)
+	unknownJson, err := json.Marshal(preExistingConfig)
+	assert.NoError(t, err)
 	configFile := filepath.Join(t.TempDir(), "test.json")
-	err := os.WriteFile(configFile, unknownJson, 0666)
-	assert.Nil(t, err)
+	err = os.WriteFile(configFile, unknownJson, 0666)
+	assert.NoError(t, err)
 	storage := configuration.NewJsonStorage(configFile)
 
 	// Act
 	err = storage.Set(key, expectedValue)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
 	// Assert
 	storedConfig := readStoredConfigFile(t, configFile)
@@ -83,9 +89,9 @@ func Test_JsonStorage_Set_ConfigFileHasValues(t *testing.T) {
 		const newValue = "new value"
 		assert.Contains(t, storedConfig, key)
 		err = storage.Set(key, newValue)
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 		storedConfig = readStoredConfigFile(t, configFile)
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 		assert.Equal(t, newValue, storedConfig[key])
 	})
 }
@@ -101,6 +107,7 @@ func Test_JsonStorage_Set_BrokenConfigFile(t *testing.T) {
 
 	// Assert
 	t.Run("Returns an error", func(t *testing.T) {
+		t.Parallel()
 		assert.NotNil(t, err)
 	})
 }
@@ -116,8 +123,26 @@ func Test_JsonStorage_Set_InvalidValue(t *testing.T) {
 
 	// Assert
 	t.Run("Returns an error", func(t *testing.T) {
+		t.Parallel()
 		assert.NotNil(t, err)
 	})
+}
+
+func Test_JsonStorage_Set_EmptyFile_SetsValidEmptyJson(t *testing.T) {
+	// Arrange
+	t.Parallel()
+	configFile := filepath.Join(t.TempDir(), "test.json")
+	err := os.WriteFile(configFile, []byte(""), 0666)
+	assert.NoError(t, err)
+	storage := configuration.NewJsonStorage(configFile)
+
+	// Act
+	err = storage.Set(key, expectedValue)
+
+	// Assert
+	assert.NoError(t, err)
+	storedConfig := readStoredConfigFile(t, configFile)
+	assertConfigContainsKey(t, storedConfig, key, expectedValue)
 }
 
 func storageWithTempConfigFile(t *testing.T, jsonBytes []byte) *configuration.JsonStorage {
@@ -148,6 +173,7 @@ func assertSetCallDoesNotDeleteOtherValues(
 	preExistingValue string,
 	preExistingValueKey string,
 ) bool {
+	t.Helper()
 	return t.Run("A second call to Set does not delete the first value", func(t *testing.T) {
 		storedConfig := readStoredConfigFile(t, configFile)
 		assert.Equal(t, preExistingValue, storedConfig[preExistingValueKey])
@@ -166,5 +192,6 @@ func assertConfigContainsKey(
 	expectedValueKey string,
 	expectedValue string,
 ) {
+	t.Helper()
 	assert.Equal(t, expectedValue, storedConfig[expectedValueKey])
 }

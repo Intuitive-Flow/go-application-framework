@@ -1,0 +1,94 @@
+{{- define "details" }}
+    {{- $sortedFindings := .Findings | sortFindingBy "Attributes.Rating.Severity.Value" .Summary.Counts.CountKeyOrderAsc.Severity }}
+    {{- $openFindings := $sortedFindings | filterFinding (notHasField "Attributes.Suppression.Kind") }}
+    {{- $ignoredFindings := $sortedFindings | filterFinding (hasField "Attributes.Suppression.Kind") }}
+    {{- $hasOpenFindings := gt ($openFindings | len) 0 }}
+    {{- $hasIgnoredFindings := gt ($ignoredFindings | len) 0 }}
+    {{- if $hasOpenFindings }}{{ "Open Issues" | title }}
+            {{- range $finding := $openFindings }}
+                {{- renderToString "finding" $finding }}
+{{end }}
+    {{- end }}
+    {{- if or (and $hasOpenFindings $hasIgnoredFindings) (eq (getValueFromConfig "include-ignores") "true") }}
+        {{- divider}}
+    {{- end}}
+{{- if eq (getValueFromConfig "include-ignores") "true" }}{{"Ignored Issues" | title }}
+    {{- if $hasIgnoredFindings }}
+            {{- range $finding := $ignoredFindings}}
+                    {{- renderToString "finding" $finding }}
+{{end }}
+            {{- else}}  There are no ignored issues
+    {{- end}}
+{{tip "Ignores are currently managed in the Snyk Web UI.\nTo edit or remove the ignore please go to: https://app.snyk.io/"}}
+{{- end}}
+{{- end}}{{/* end "details" */}}
+
+{{define "header" }}
+{{ print "Testing " .Summary.Path  " ..." | bold }}
+{{end }}
+
+{{- define "summary"}}{{ "Test Summary" | bold }}
+
+  Organization:      {{ getValueFromConfig "internal_org_slug" }}
+  Test type:         {{ if eq .Summary.Type "sast" }}Static code analysis{{else}}{{ .Summary.Type }}}{{ end}}
+  Project path:      {{ .Summary.Path }}
+
+  {{- $totalIssueCount := .Summary.Counts.Count }}
+  {{- $openIssueCount := .Summary.Counts.CountAdjusted }}
+  {{- $ignoredIssueCount := .Summary.Counts.CountSuppressed }}
+
+  Total issues:   {{ $totalIssueCount }}
+  {{- if gt $totalIssueCount 0}}
+  Ignored issues: {{ print  $ignoredIssueCount | bold }} [
+  {{- range $severity := .Summary.Counts.CountKeyOrderAsc.Severity | reverse }}
+      {{- $countFound := 0 }}
+          {{- if gt (index $.Summary.Counts.CountBySuppressed.Severity $severity) 0}}
+              {{- $countFound = index $.Summary.Counts.CountBySuppressed.Severity $severity }}
+          {{- end}}
+      {{- print " " $countFound " " $severity " " | toUpperCase | renderInSeverityColor }}
+  {{- end}}]
+  Open issues:    {{ print $openIssueCount | bold }} [
+  {{- range $severity := .Summary.Counts.CountKeyOrderAsc.Severity | reverse }}
+      {{- $countFound := 0 }}
+          {{- if gt (index $.Summary.Counts.CountByAdjusted.Severity $severity) 0 }}
+              {{- $countFound = index $.Summary.Counts.CountByAdjusted.Severity $severity }}
+          {{- end}}
+      {{- print " " $countFound " " $severity " " | toUpperCase | renderInSeverityColor }}
+  {{- end}}]{{- end}}
+{{- end }} {{/* end summary */}}
+
+{{- define "main" }}
+{{- range $result := $.Results}}
+    {{- template "header"  $result }}
+    {{- template "details" $result }}
+
+    {{- if not (eq (getValueFromConfig "severity-threshold") "") }}
+        {{ tip "You are currently viewing results with --severity-threshold applied.\nTo view all issues, remove the --severity-threshold flag"}}
+    {{- end }}
+
+    {{- "\n\n" }}
+
+    {{- box (renderToString "summary" $result)}}
+
+{{- if .Links.report }}
+
+{{ "Report" | bold }}
+  {{- "\n" }}
+  Your test results are available at:
+  {{ .Links.report | bold }}
+  {{- end }}
+
+    {{- "\n    " }}
+
+
+    {{- if ne (getValueFromConfig "include-ignores") "true" }}
+
+        {{- tip "To view ignored issues, use the --include-ignores option."}}
+        {{- "\n" }}
+    {{- end }}
+
+{{- end }}
+
+{{- end }} {{/* end main */}}
+
+{{ template "main" . }}

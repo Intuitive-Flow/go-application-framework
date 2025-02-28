@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"os/user"
 	"strings"
 	"testing"
@@ -14,8 +13,7 @@ import (
 )
 
 func Test_Basic(t *testing.T) {
-
-	os.Setenv("CIRCLECI", "true")
+	t.Setenv("CIRCLECI", "true")
 	testFields := []string{
 		"tfc-token",
 		"azurerm-account-key",
@@ -44,8 +42,7 @@ func Test_Basic(t *testing.T) {
 	commandList := []string{"", "iac capture"}
 	for _, cmd := range commandList {
 		t.Run(cmd, func(t *testing.T) {
-
-			analytics := New()
+			analytics := newTestAnalytics(t)
 			analytics.SetCmdArguments(args)
 			analytics.AddError(fmt.Errorf("Something went terrible wrong."))
 			analytics.SetVersion("1234567")
@@ -66,8 +63,8 @@ func Test_Basic(t *testing.T) {
 			assert.NotNil(t, request)
 			assert.True(t, analytics.IsCiEnvironment())
 
-			expectedAuthHeader, _ := h["Authorization"]
-			actualAuthHeader, _ := request.Header["Authorization"]
+			expectedAuthHeader := h["Authorization"]
+			actualAuthHeader := request.Header["Authorization"]
 			assert.Equal(t, expectedAuthHeader, actualAuthHeader)
 
 			requestUrl := request.URL.String()
@@ -76,7 +73,8 @@ func Test_Basic(t *testing.T) {
 
 			body, err := io.ReadAll(request.Body)
 			assert.Nil(t, err)
-			assert.Equal(t, len(testFields), strings.Count(string(body), sanitize_replacement_string), "Not all sensitive values have been replaced!")
+			// expect no CLI args to be sent to analytics (CLI-586)
+			assert.Equal(t, 0, strings.Count(string(body), sanitizeReplacementString))
 
 			var requestBody dataOutput
 			err = json.Unmarshal(body, &requestBody)
@@ -94,7 +92,6 @@ func Test_Basic(t *testing.T) {
 			fmt.Println("Request Body: " + string(body))
 		})
 	}
-
 }
 
 func Test_SanitizeValuesByKey(t *testing.T) {
@@ -122,23 +119,26 @@ func Test_SanitizeValuesByKey(t *testing.T) {
 
 	// test input
 	filter := sensitiveFieldNames
-	input, _ := json.Marshal(inputStruct)
-	replacement := sanitize_replacement_string
+	input, err := json.Marshal(inputStruct)
+	assert.NoError(t, err)
+
+	replacement := sanitizeReplacementString
 
 	fmt.Println("Before: " + string(input))
 
 	// invoke method under test
 	output, err := SanitizeValuesByKey(filter, replacement, input)
+	assert.NoError(t, err)
 
 	fmt.Println("After: " + string(output))
 
-	assert.Nil(t, err, "Failed to santize!")
+	assert.NoError(t, err, "Failed to santize!")
 	actualNumberOfRedacted := strings.Count(string(output), replacement)
 	assert.Equal(t, expectedNumberOfRedacted, actualNumberOfRedacted)
 
 	var outputStruct sanTest
 	err = json.Unmarshal(output, &outputStruct)
-	assert.Nil(t, err, "Failed to decode json object!")
+	assert.NoError(t, err, "Failed to decode json object!")
 
 	// count how often the known secrets are being found in the input and the output
 	secretsCountAfter := 0
@@ -163,7 +163,7 @@ func Test_SanitizeUsername(t *testing.T) {
 		homeDir      string
 	}
 
-	user, err := user.Current()
+	user, err := testUserCurrent(t)()
 	assert.Nil(t, err)
 
 	// runs 3 cases
@@ -205,14 +205,15 @@ func Test_SanitizeUsername(t *testing.T) {
 			Other:    fmt.Sprintf("some other value where %s is contained", rawUserName),
 		}
 
-		input, _ := json.Marshal(inputStruct)
+		input, err := json.Marshal(inputStruct)
+		assert.NoError(t, err)
 		fmt.Printf("%d - Before: %s\n", i, string(input))
 
 		// invoke method under test
 		output, err := SanitizeUsername(rawUserName, homeDir, replacement, input)
 
 		fmt.Printf("%d - After: %s\n", i, string(output))
-		assert.Nil(t, err, "Failed to santize static values!")
+		assert.NoError(t, err, "Failed to santize static values!")
 
 		numRedacted := strings.Count(string(output), replacement)
 		assert.Equal(t, 2, numRedacted)
@@ -227,8 +228,27 @@ func Test_SanitizeUsername(t *testing.T) {
 		assert.Equal(t, 0, numHomeDirInstances)
 
 		var outputStruct sanTest
-		json.Unmarshal(output, &outputStruct)
-
+		err = json.Unmarshal(output, &outputStruct)
+		assert.NoError(t, err)
 	}
+}
 
+func newTestAnalytics(t *testing.T) Analytics {
+	t.Helper()
+	a := New()
+	a.(*AnalyticsImpl).userCurrent = testUserCurrent(t)
+	return a
+}
+
+func testUserCurrent(t *testing.T) func() (*user.User, error) {
+	t.Helper()
+	return func() (*user.User, error) {
+		return &user.User{
+			Uid:      "1000",
+			Gid:      "1000",
+			Username: "test-runner-user",
+			Name:     "Test Runner User",
+			HomeDir:  t.TempDir(),
+		}, nil
+	}
 }

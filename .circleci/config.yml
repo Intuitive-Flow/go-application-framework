@@ -1,43 +1,98 @@
 version: 2.1
 
 orbs:
-  prodsec: snyk/prodsec-orb@1.0
+  prodsec: snyk/prodsec-orb@1
+  win: circleci/windows@5.0
 
-executors:
-  linux:
-    machine:
-      image: ubuntu-2004:2022.07.1
+
+base_image: &base_image
+  resource_class: small
+  docker:
+    - image: cimg/go:1.22
 
 # Define the jobs we want to run for this project
 jobs:
   unit_test:
-    executor: linux
+    <<: *base_image
+    resource_class: medium
     steps:
       - checkout
       - run:
           name: Run unit tests
           command: make test
+
+  windows_test:
+    executor:
+      name: win/server-2022
+      version: "current"
+
+    steps:
+      - run:
+          name: Configure git to translate line terminators locally
+          command: git config --global core.autocrlf input
+      - checkout
+      - run:
+          name: Run unit tests
+          command: go test ./...
+
   build:
-    executor: linux
+    <<: *base_image
     steps:
       - checkout
+      - restore-build-cache
+      - run:
+          environment:
+            # we re-use the Go build cache as our lint-cache too.
+            GOLANGCI_LINT_CACHE: /home/circleci/.cache/go-build
+          name: Lint
+          command: make lint
       - run:
           name: Build
           command: make build
-  
+      - save-build-cache
+
+  security-scans:
+    <<: *base_image
+    steps:
+      - checkout
+      - prodsec/security_scans:
+          mode: auto
+
+commands:
+  save-build-cache:
+    steps:
+      - save_cache:
+          name: Saving Go build cache
+          key: go-build-cache-{{ .Branch }}-{{ .Revision }}
+          paths:
+            - /home/circleci/.cache/go-build
+  restore-build-cache:
+    steps:
+      - restore_cache:
+          name: Restoring Go build cache
+          keys:
+            - go-build-cache-{{ .Branch }}-{{ .Revision }}
+            - go-build-cache-{{ .Branch }}-
+            - go-build-cache-
+
+
 # Orchestrate our job run sequence
 workflows:
-  version: 2
   test_and_release:
     jobs:
       - prodsec/secrets-scan:
           name: Scan repository for secrets
           context:
             - snyk-bot-slack
-          channel: hammerhead-alerts
+          channel: cli-alerts
+      - security-scans:
+          context: devex_cli
       - unit_test:
           name: Unit tests
+      - windows_test:
+          name: Windows tests
       - build:
           name: Build
           requires:
             - Unit tests
+            - Windows tests

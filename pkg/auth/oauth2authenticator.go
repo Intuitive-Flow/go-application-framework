@@ -2,33 +2,51 @@ package auth
 
 import (
 	"context"
-	crypto_rand "crypto/rand"
+	"crypto/rand"
 	"crypto/sha256"
+	_ "embed"
 	"encoding/base64"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"html"
-	"math/rand"
+	"html/template"
+	"math/big"
 	"net"
 	"net/http"
+	"net/url"
+	"regexp"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/pkg/browser"
+	"github.com/rs/zerolog"
 	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/clientcredentials"
 
+	"github.com/snyk/go-application-framework/internal/api"
 	"github.com/snyk/go-application-framework/pkg/configuration"
 )
 
 const (
-	CONFIG_KEY_OAUTH_TOKEN string        = "INTERNAL_OAUTH_TOKEN_STORAGE"
-	OAUTH_CLIENT_ID        string        = "b56d4c2e-b9e1-4d27-8773-ad47eafb0956"
-	CALLBACK_HOSTNAME      string        = "127.0.0.1"
-	CALLBACK_PATH          string        = "/authorization-code/callback"
-	TIMEOUT_SECONDS        time.Duration = 120 * time.Second
-	AUTHENTICATED_MESSAGE                = "Your account has been authenticated."
+	//nolint:gosec // not a token value, but a configuration key
+	CONFIG_KEY_ALLOWED_HOST_REGEXP        = "INTERNAL_OAUTH_ALLOWED_HOSTS"
+	CONFIG_KEY_OAUTH_TOKEN         string = "INTERNAL_OAUTH_TOKEN_STORAGE"
+	OAUTH_CLIENT_ID                string = "b56d4c2e-b9e1-4d27-8773-ad47eafb0956"
+	CALLBACK_HOSTNAME              string = "127.0.0.1"
+	CALLBACK_PATH                  string = "/authorization-code/callback"
+	TIMEOUT_SECONDS                       = 120 * time.Second
+	AUTHENTICATED_MESSAGE                 = "Your account has been authenticated."
+	PARAMETER_CLIENT_ID            string = "client-id"
+	PARAMETER_CLIENT_SECRET        string = "client-secret"
+)
+
+type GrantType int
+
+const (
+	ClientCredentialsGrant GrantType = iota
+	AuthorizationCodeGrant
 )
 
 var _ Authenticator = (*oAuth2Authenticator)(nil)
@@ -36,38 +54,30 @@ var _ Authenticator = (*oAuth2Authenticator)(nil)
 var acceptedCallbackPorts = []int{8080, 18081, 28082, 38083, 48084}
 var globalRefreshMutex sync.Mutex
 
+//go:embed errorresponse.html
+var errorResponsePage string
+
 type oAuth2Authenticator struct {
 	httpClient         *http.Client
 	config             configuration.Configuration
 	oauthConfig        *oauth2.Config
 	token              *oauth2.Token
 	headless           bool
+	grantType          GrantType
+	logger             *zerolog.Logger
 	openBrowserFunc    func(authUrl string)
 	shutdownServerFunc func(server *http.Server)
 	tokenRefresherFunc func(ctx context.Context, oauthConfig *oauth2.Config, token *oauth2.Token) (*oauth2.Token, error)
 }
 
-func init() {
-	var seed int64
-	var b [8]byte
-
-	// try to use a real random value to seed the pseudo random number generator and
-	// only fall back to time based seed if this didn't work.
-	_, err := crypto_rand.Read(b[:])
-	if err != nil {
-		seed = time.Now().UnixNano() // fallback to time only if necessary
-	} else {
-		seed = int64(binary.LittleEndian.Uint64(b[:])) // based on https://stackoverflow.com/a/54491783
-	}
-	rand.Seed(seed)
-}
-
 func OpenBrowser(authUrl string) {
+	//nolint:errcheck // breaking api change needed to fix this
 	_ = browser.OpenURL(authUrl)
 }
 
 func ShutdownServer(server *http.Server) {
 	time.Sleep(500)
+	//nolint:errcheck // breaking api change needed to fix this
 	_ = server.Shutdown(context.Background())
 }
 
@@ -85,9 +95,25 @@ func getOAuthConfiguration(config configuration.Configuration) *oauth2.Config {
 	conf := &oauth2.Config{
 		ClientID: OAUTH_CLIENT_ID,
 		Endpoint: oauth2.Endpoint{
-			TokenURL: tokenUrl,
-			AuthURL:  authUrl,
+			TokenURL:  tokenUrl,
+			AuthURL:   authUrl,
+			AuthStyle: oauth2.AuthStyleInParams,
 		},
+	}
+
+	if determineGrantType(config) == ClientCredentialsGrant {
+		conf.ClientID = config.GetString(PARAMETER_CLIENT_ID)
+		conf.ClientSecret = config.GetString(PARAMETER_CLIENT_SECRET)
+	}
+
+	return conf
+}
+
+func getOAuthConfigurationClientCredentials(in *oauth2.Config) *clientcredentials.Config {
+	conf := &clientcredentials.Config{
+		ClientID:     in.ClientID,
+		ClientSecret: in.ClientSecret,
+		TokenURL:     in.Endpoint.TokenURL,
 	}
 	return conf
 }
@@ -101,7 +127,7 @@ func getCodeChallenge(verifier []byte) string {
 
 // This method creates a code verifier as defined in https://www.rfc-editor.org/rfc/rfc7636#section-4.1
 // It accepts the number of bytes it shall create and returns the verifier as a byte slice of the specified length.
-func createVerifier(count int) []byte {
+func createVerifier(count int) ([]byte, error) {
 	/*
 	  unreserved = ALPHA / DIGIT / "-" / "." / "_" / "~"
 	   ALPHA = %x41-5A / %x61-7A
@@ -110,13 +136,27 @@ func createVerifier(count int) []byte {
 	lut := []byte("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
 	verifier := make([]byte, count)
 
-	// TODO is this good enough?
 	for i := range verifier {
-		index := rand.Int() % len(lut)
+		index, err := randIndex(len(lut))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create verifier: %w", err)
+		}
 		verifier[i] = lut[index]
 	}
 
-	return verifier
+	return verifier, nil
+}
+
+// randIndex provides a secure random number in the range [0, limit).
+func randIndex(limit int) (int, error) {
+	if limit <= 0 {
+		return -1, fmt.Errorf("invalid limit %d", limit)
+	}
+	n, err := rand.Int(rand.Reader, big.NewInt(int64(limit)))
+	if err != nil {
+		return -1, fmt.Errorf("failed to read secure random bytes: %w", err)
+	}
+	return int(n.Int64()), nil
 }
 
 // GetOAuthToken extracts an oauth2.Token from the given configuration instance if available
@@ -130,12 +170,27 @@ func GetOAuthToken(config configuration.Configuration) (*oauth2.Token, error) {
 		}
 		return token, nil
 	}
+	//nolint:nilnil // using a sentinel error here breaks existing API contract
 	return nil, nil
 }
 
 func RefreshToken(ctx context.Context, oauthConfig *oauth2.Config, token *oauth2.Token) (*oauth2.Token, error) {
 	tokenSource := oauthConfig.TokenSource(ctx, token)
 	return tokenSource.Token()
+}
+
+func refreshTokenClientCredentials(ctx context.Context, oauthConfig *oauth2.Config, _ *oauth2.Token) (*oauth2.Token, error) {
+	conf := getOAuthConfigurationClientCredentials(oauthConfig)
+	tokenSource := conf.TokenSource(ctx)
+	return tokenSource.Token()
+}
+
+func determineGrantType(config configuration.Configuration) GrantType {
+	grantType := AuthorizationCodeGrant
+	if config.IsSet(PARAMETER_CLIENT_SECRET) && config.IsSet(PARAMETER_CLIENT_ID) {
+		grantType = ClientCredentialsGrant
+	}
+	return grantType
 }
 
 //goland:noinspection GoUnusedExportedFunction
@@ -145,7 +200,11 @@ func NewOAuth2Authenticator(config configuration.Configuration, httpClient *http
 
 func NewOAuth2AuthenticatorWithOpts(config configuration.Configuration, opts ...OAuth2AuthenticatorOption) Authenticator {
 	o := &oAuth2Authenticator{}
+	nopLogger := zerolog.Nop()
+
+	o.logger = &nopLogger
 	o.config = config
+	//nolint:errcheck // breaking api change needed to fix this
 	o.token, _ = GetOAuthToken(config)
 	o.oauthConfig = getOAuthConfiguration(config)
 	config.PersistInStorage(CONFIG_KEY_OAUTH_TOKEN)
@@ -154,7 +213,14 @@ func NewOAuth2AuthenticatorWithOpts(config configuration.Configuration, opts ...
 	o.httpClient = http.DefaultClient
 	o.openBrowserFunc = OpenBrowser
 	o.shutdownServerFunc = ShutdownServer
-	o.tokenRefresherFunc = RefreshToken
+	o.grantType = determineGrantType(config)
+
+	// set refresh function depending on grant type
+	if o.grantType == ClientCredentialsGrant {
+		o.tokenRefresherFunc = refreshTokenClientCredentials
+	} else {
+		o.tokenRefresherFunc = RefreshToken
+	}
 
 	// apply options
 	for _, opt := range opts {
@@ -186,18 +252,61 @@ func (o *oAuth2Authenticator) IsSupported() bool {
 	return tokenExistent && featureEnabled
 }
 
-func (o *oAuth2Authenticator) persistToken(token *oauth2.Token) {
-	tokenstring, _ := json.Marshal(token)
+func (o *oAuth2Authenticator) persistToken(token *oauth2.Token) error {
+	tokenstring, err := json.Marshal(token)
+	if err != nil {
+		return err
+	}
 	o.config.Set(CONFIG_KEY_OAUTH_TOKEN, string(tokenstring))
 	o.token = token
+	return nil
 }
 
 func (o *oAuth2Authenticator) Authenticate() error {
+	var err error
+
+	if o.grantType == ClientCredentialsGrant {
+		err = o.authenticateWithClientCredentialsGrant()
+	} else {
+		err = o.authenticateWithAuthorizationCode()
+	}
+
+	return err
+}
+
+func (o *oAuth2Authenticator) authenticateWithClientCredentialsGrant() error {
+	ctx := context.Background()
+	config := getOAuthConfigurationClientCredentials(o.oauthConfig)
+
+	// Use the custom HTTP client when requesting a token.
+	if o.httpClient != nil {
+		ctx = context.WithValue(ctx, oauth2.HTTPClient, o.httpClient)
+	}
+
+	// get token
+	token, err := config.Token(ctx)
+	if err != nil {
+		return err
+	}
+
+	err = o.persistToken(token)
+	return err
+}
+
+func (o *oAuth2Authenticator) authenticateWithAuthorizationCode() error {
 	var responseCode string
 	var responseState string
 	var responseError string
-	verifier := createVerifier(128)
-	state := string(createVerifier(15))
+	var responseInstance string
+	verifier, err := createVerifier(128)
+	if err != nil {
+		return err
+	}
+	stateBytes, err := createVerifier(15)
+	if err != nil {
+		return err
+	}
+	state := string(stateBytes)
 	codeChallenge := getCodeChallenge(verifier)
 	ctx := context.Background()
 
@@ -207,18 +316,23 @@ func (o *oAuth2Authenticator) Authenticate() error {
 
 	mux := http.NewServeMux()
 
+	//nolint:gosec // ignoring read timeouts here as we're client to ourselves
 	srv := &http.Server{
 		Handler: mux,
 	}
 	mux.HandleFunc(CALLBACK_PATH, func(w http.ResponseWriter, r *http.Request) {
 		responseError = html.EscapeString(r.URL.Query().Get("error"))
 		if len(responseError) > 0 {
-			details := html.EscapeString(r.URL.Query().Get("error_description"))
-			_, _ = fmt.Fprintf(w, "Failed to authenticate. (%s)\n%s", responseError, details)
+			if writeCallbackErrorResponse(w, r.URL.Query(), responseError) {
+				return
+			}
 		} else {
+			appUrl := o.config.GetString(configuration.WEB_APP_URL)
 			responseCode = html.EscapeString(r.URL.Query().Get("code"))
 			responseState = html.EscapeString(r.URL.Query().Get("state"))
-			_, _ = fmt.Fprint(w, AUTHENTICATED_MESSAGE)
+			responseInstance = html.EscapeString(r.URL.Query().Get("instance"))
+			w.Header().Add("Location", appUrl+"/authenticated?type=oauth")
+			w.WriteHeader(http.StatusMovedPermanently)
 		}
 
 		go o.shutdownServerFunc(srv)
@@ -227,31 +341,31 @@ func (o *oAuth2Authenticator) Authenticate() error {
 	// iterate over different known ports if one fails
 	for _, port := range acceptedCallbackPorts {
 		srv.Addr = fmt.Sprintf("%s:%d", CALLBACK_HOSTNAME, port)
-		listener, err := net.Listen("tcp", srv.Addr)
-		if err != nil { // skip port if it can't be listened to
+		listener, listenErr := net.Listen("tcp", srv.Addr)
+		if listenErr != nil { // skip port if it can't be listened to
 			continue
 		}
 
 		// fill redirect url now that the port is known
 		o.oauthConfig.RedirectURL = getRedirectUri(port)
-
-		url := o.oauthConfig.AuthCodeURL(state, oauth2.AccessTypeOffline,
+		authCodeUrl := o.oauthConfig.AuthCodeURL(state, oauth2.AccessTypeOffline,
 			oauth2.SetAuthURLParam("code_challenge", codeChallenge),
 			oauth2.SetAuthURLParam("code_challenge_method", "S256"),
 			oauth2.SetAuthURLParam("response_type", "code"),
 			oauth2.SetAuthURLParam("scope", "offline_access"),
-			oauth2.SetAuthURLParam("version", "2021-08-11~experimental"))
+			oauth2.SetAuthURLParam("version", "2021-08-11~experimental"),
+			oauth2.SetAuthURLParam("cross_region_routing", "true"))
 
 		// launch browser
-		go o.openBrowserFunc(url)
+		go o.openBrowserFunc(authCodeUrl)
 
 		timedOut := false
 		timer := time.AfterFunc(TIMEOUT_SECONDS, func() {
 			timedOut = true
 			o.shutdownServerFunc(srv)
 		})
-		err = srv.Serve(listener)
-		if err == http.ErrServerClosed { // if the server was shutdown normally, there is no need to iterate further
+		listenErr = srv.Serve(listener)
+		if errors.Is(listenErr, http.ErrServerClosed) { // if the server was shutdown normally, there is no need to iterate further
 			if timedOut {
 				return errors.New("authentication failed (timeout)")
 			}
@@ -269,6 +383,11 @@ func (o *oAuth2Authenticator) Authenticate() error {
 		return fmt.Errorf("incorrect response state: %s != %s", responseState, state)
 	}
 
+	modifyTokenErr := o.modifyTokenUrl(responseInstance)
+	if modifyTokenErr != nil {
+		return modifyTokenErr
+	}
+
 	// Use the custom HTTP client when requesting a token.
 	if o.httpClient != nil {
 		ctx = context.WithValue(ctx, oauth2.HTTPClient, o.httpClient)
@@ -279,8 +398,102 @@ func (o *oAuth2Authenticator) Authenticate() error {
 		return err
 	}
 
-	o.persistToken(token)
+	err = o.persistToken(token)
+	return err
+}
+
+func writeCallbackErrorResponse(w http.ResponseWriter, q url.Values, responseError string) bool {
+	tmpl := template.New("")
+	tmpl, tmplError := tmpl.Parse(errorResponsePage)
+	if tmplError != nil {
+		return true
+	}
+
+	data := struct {
+		Reason      string
+		Description string
+	}{
+		Reason:      responseError,
+		Description: html.EscapeString(q.Get("error_description")),
+	}
+
+	tmplError = tmpl.Execute(w, data)
+
+	return tmplError != nil
+}
+
+func (o *oAuth2Authenticator) modifyTokenUrl(responseInstance string) error {
+	if responseInstance == "" {
+		return nil
+	}
+
+	o.logger.Info().Msg("Instance specified in callback " + responseInstance)
+	authHost, err := redirectAuthHost(responseInstance)
+	if err != nil {
+		// todo error-catalog error
+		return err
+	}
+
+	redirectAuthHostRE := o.config.GetString(CONFIG_KEY_ALLOWED_HOST_REGEXP)
+	o.logger.Info().Msgf("Validating with regexp: \"%s\"", redirectAuthHostRE)
+	isValidHost, err := isValidAuthHost(authHost, redirectAuthHostRE)
+	if err != nil {
+		return err
+	}
+
+	if !isValidHost {
+		o.logger.Info().Msg("Instance specified in callback was invalid:" + authHost)
+		return fmt.Errorf("specified instance is an invalid host")
+	}
+
+	oauthTokenUrl, urlParseErr := url.Parse(o.oauthConfig.Endpoint.TokenURL)
+	if urlParseErr != nil {
+		return fmt.Errorf("failed to parse auth url: %w", urlParseErr)
+	}
+	if oauthTokenUrl.Host == authHost {
+		o.logger.Info().Msgf("Instance specified in callback (%s) matches pre-configured value (%s)", authHost, oauthTokenUrl.Host)
+		return nil
+	}
+
+	o.logger.Info().Msgf("Instance specified in callback (%s) does not match pre-configured value (%s)", authHost, oauthTokenUrl.Host)
+	// file deepcode ignore Ssrf: false positive
+	oauthTokenUrl.Host = authHost
+	o.oauthConfig.Endpoint.TokenURL = oauthTokenUrl.String()
+	o.logger.Info().Msgf("New token url endpoint is: %s", o.oauthConfig.Endpoint.TokenURL)
+
 	return nil
+}
+
+func redirectAuthHost(instance string) (string, error) {
+	// handle both cases if instance is a URL or just a host
+	if !strings.HasPrefix(instance, "http") {
+		instance = "https://" + instance
+	}
+
+	instanceUrl, err := url.Parse(instance)
+	if err != nil {
+		return "", err
+	}
+
+	canonicalizedInstanceUrl, err := api.GetCanonicalApiAsUrl(*instanceUrl)
+	if err != nil {
+		return "", err
+	}
+
+	return canonicalizedInstanceUrl.Host, nil
+}
+
+func isValidAuthHost(authHost string, hostRegularExpression string) (bool, error) {
+	if len(hostRegularExpression) == 0 {
+		return false, fmt.Errorf("regular expression to check host names must not be empty")
+	}
+
+	r, err := regexp.Compile(hostRegularExpression)
+	if err != nil {
+		return false, err
+	}
+
+	return r.MatchString(authHost), nil
 }
 
 func (o *oAuth2Authenticator) AddAuthenticationHeader(request *http.Request) error {
@@ -291,19 +504,32 @@ func (o *oAuth2Authenticator) AddAuthenticationHeader(request *http.Request) err
 		return fmt.Errorf("oauth token must not be nil to authorize")
 	}
 
-	ctx := context.Background()
+	ctx := request.Context()
 
 	if o.httpClient != nil {
 		ctx = context.WithValue(ctx, oauth2.HTTPClient, o.httpClient)
 	}
 
+	// Also ensure this in-process across goroutines.
+	globalRefreshMutex.Lock()
+	defer globalRefreshMutex.Unlock()
+
 	// if the current token is invalid
 	if !o.token.Valid() {
-		globalRefreshMutex.Lock()
-		defer globalRefreshMutex.Unlock()
+		// Ensure oauth token refresh is atomic and does not operate on a stale
+		// token across concurrent processes.
+		cleanup, err := o.syncTokenRefresh(ctx)
+		defer cleanup()
+		if err != nil {
+			return err
+		}
 
 		// check if the token in the config is invalid as well
-		token, _ := GetOAuthToken(o.config)
+		token, err := GetOAuthToken(o.config)
+		if err != nil {
+			return err
+		}
+
 		if !token.Valid() {
 			// use TokenSource to refresh the token
 			validToken, err := o.tokenRefresherFunc(ctx, o.oauthConfig, o.token)
@@ -312,7 +538,9 @@ func (o *oAuth2Authenticator) AddAuthenticationHeader(request *http.Request) err
 			}
 
 			if validToken != o.token {
-				o.persistToken(validToken)
+				if err := o.persistToken(validToken); err != nil {
+					return err
+				}
 			}
 		} else {
 			o.token = token
@@ -327,4 +555,47 @@ func (o *oAuth2Authenticator) AddAuthenticationHeader(request *http.Request) err
 	}
 
 	return nil
+}
+
+const syncTokenRefreshRetryDelay = time.Millisecond * 100
+
+// syncTokenRefresh ensures that an oauth token refresh and configuration file
+// update is atomic when there are multiple concurrent processes which might
+// attempt to refresh.
+//
+// This function also ensures that the token is up to date before refreshing.
+//
+// The returned cleanup function must be called, even if an error occurred.
+func (o *oAuth2Authenticator) syncTokenRefresh(ctx context.Context) (func(), error) {
+	cleanup := func() {}
+	if storage := o.config.GetStorage(); storage != nil {
+		// Lock configuration storage and refresh, to avoid oAuth2Authenticator
+		// racing with itself on concurrently rotating client & refresh tokens.
+		err := storage.Lock(ctx, syncTokenRefreshRetryDelay)
+		if err != nil {
+			return cleanup, err
+		}
+		cleanup = func() {
+			_ = storage.Unlock() //nolint:errcheck // unlock errors are ignored, pending future GAF observability improvements
+		}
+
+		// Even if we obtained the lock, it's also possible that our
+		// configuration has gone stale since originally read, by another
+		// process refreshing before the above lock was reached.
+		//
+		// To avoid this, unconditionally refresh the configuation from its
+		// storage and re-parse the oauth token stored within.
+		if err = storage.Refresh(o.config, CONFIG_KEY_OAUTH_TOKEN); err != nil {
+			return cleanup, err
+		}
+		o.token, err = GetOAuthToken(o.config)
+		if err != nil {
+			return cleanup, err
+		}
+		if o.token == nil {
+			return cleanup, fmt.Errorf("oauth token must not be nil to authorize")
+		}
+	}
+
+	return cleanup, nil
 }

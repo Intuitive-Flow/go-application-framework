@@ -1,6 +1,8 @@
 package middleware
 
 import (
+	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
@@ -51,9 +53,8 @@ func ShouldRequireAuthentication(
 ) (matchesPattern bool, err error) {
 	subdomainsToCheck := append([]string{""}, additionalSubdomains...)
 	for _, subdomain := range subdomainsToCheck {
-		matchesPattern := false
-		referenceUrl := ""
-		prefixUrl := ""
+		var matchesPattern bool
+		var prefixUrl, referenceUrl string
 		if len(subdomain) == 0 {
 			prefixUrl = apiUrl
 			referenceUrl, err = api.GetCanonicalApiUrl(*url)
@@ -81,9 +82,17 @@ func ShouldRequireAuthentication(
 	}
 
 	return false, nil
-
 }
 
+// ErrAuthenticationFailed indicates that authentication failed in the
+// networking middleware.
+var ErrAuthenticationFailed = fmt.Errorf("authentication failed")
+
+// AddAuthenticationHeader determines whether a request needs authentication,
+// negotiates authorization and sets request headers if necessary.
+//
+// If this fails due to an authentication error, the resulting error will match
+// ErrAuthenticationFailed.
 func AddAuthenticationHeader(
 	authenticator auth.Authenticator,
 	config configuration.Configuration,
@@ -100,5 +109,8 @@ func AddAuthenticationHeader(
 	}
 
 	err = authenticator.AddAuthenticationHeader(request)
-	return err
+	if err != nil {
+		return errors.Join(err, ErrAuthenticationFailed)
+	}
+	return nil
 }

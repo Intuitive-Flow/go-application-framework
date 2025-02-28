@@ -2,9 +2,16 @@ package ui
 
 import (
 	"bufio"
+	"context"
+	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strings"
+
+	"github.com/mattn/go-isatty"
+	"github.com/snyk/error-catalog-golang-public/snyk_errors"
+	"github.com/snyk/go-application-framework/internal/presenters"
 
 	"github.com/snyk/go-application-framework/pkg/utils"
 )
@@ -13,14 +20,34 @@ import (
 
 type UserInterface interface {
 	Output(output string) error
-	OutputError(err error) error
+	OutputError(err error, opts ...Opts) error
 	NewProgressBar() ProgressBar
 	Input(prompt string) (string, error)
 }
 
 func DefaultUi() UserInterface {
+	return newConsoleUi(os.Stdin, os.Stdout, os.Stderr)
+}
+
+func newConsoleUi(in io.Reader, out io.Writer, err io.Writer) UserInterface {
 	// Default Console UI should not have errors (this is tested in consoleui_test.go)
-	return utils.ValueOf(NewConsoleUiBuilder().Build())
+	defaultUi := &consoleUi{
+		writer:      out,
+		errorWriter: out,
+		reader:      bufio.NewReader(in),
+	}
+
+	defaultUi.progressBarFactory = func() ProgressBar {
+		if stderr, ok := err.(*os.File); ok {
+			if isatty.IsTerminal(stderr.Fd()) || isatty.IsCygwinTerminal(stderr.Fd()) {
+				return newProgressBar(err, SpinnerType, true)
+			}
+		}
+
+		return emptyProgressBar{}
+	}
+
+	return defaultUi
 }
 
 type consoleUi struct {
@@ -30,12 +57,48 @@ type consoleUi struct {
 	reader             *bufio.Reader
 }
 
+type uiConfig struct {
+	//nolint:containedctx // internal struct used to maintain backwards compatibility
+	context context.Context
+}
+
+type Opts = func(ui *uiConfig)
+
+func WithContext(ctx context.Context) Opts {
+	return func(ui *uiConfig) {
+		ui.context = ctx
+	}
+}
+
 func (ui *consoleUi) Output(output string) error {
 	return utils.ErrorOf(fmt.Fprintln(ui.writer, output))
 }
 
-func (ui *consoleUi) OutputError(err error) error {
-	return utils.ErrorOf(fmt.Fprintln(ui.errorWriter, "Error: "+err.Error()))
+func (ui *consoleUi) OutputError(err error, opts ...Opts) error {
+	uiConfig := &uiConfig{
+		context: context.Background(),
+	}
+	for _, opt := range opts {
+		opt(uiConfig)
+	}
+	// nothing needs to be done if err is nil
+	if err == nil {
+		return nil
+	}
+
+	// for simplistic handling of error catalog errors
+	var snykError snyk_errors.Error
+	if errors.As(err, &snykError) {
+		uiError := utils.ErrorOf(fmt.Fprintln(ui.errorWriter, presenters.RenderError(snykError, uiConfig.context)))
+		if uiError != nil {
+			return uiError
+		}
+
+		return nil
+	}
+
+	// Default handling for all other errors
+	return utils.ErrorOf(fmt.Fprintln(ui.errorWriter, err.Error()))
 }
 
 func (ui *consoleUi) NewProgressBar() ProgressBar {

@@ -24,64 +24,68 @@ func Test_GetExtraCaCert_InvalidPathSpecified(t *testing.T) {
 }
 
 func Test_GetExtraCaCert_InvalidCertSpecified(t *testing.T) {
-	file, _ := os.CreateTemp("", "")
-	file.Write([]byte{'h', 'e', 'l', 'l', 'o'})
+	file, err := os.CreateTemp(t.TempDir(), "")
+	defer func() { _ = file.Close() }()
+	assert.NoError(t, err)
+	_, err = file.Write([]byte{'h', 'e', 'l', 'l', 'o'})
+	assert.NoError(t, err)
 
 	extraCertificateBytes, extraCertificateList, extraCertificateError := GetExtraCaCert(file.Name())
 	fmt.Println(string(extraCertificateBytes))
 	assert.Empty(t, extraCertificateList)
 	assert.Empty(t, extraCertificateBytes)
 	assert.NotNil(t, extraCertificateError)
-
-	// cleanup
-	os.Remove(file.Name())
 }
 
 func Test_GetExtraCaCert_CertSpecified(t *testing.T) {
 	logger := log.Default()
-	certPem, _, _ := MakeSelfSignedCert("mycert", []string{"dns"}, logger)
-	file, _ := os.CreateTemp("", "")
-	file.Write(certPem)
+	certPem, _, err := MakeSelfSignedCert("mycert", []string{"dns"}, logger)
+	assert.NoError(t, err)
+	file, err := os.CreateTemp(t.TempDir(), "")
+	defer func() { _ = file.Close() }()
+	assert.NoError(t, err)
+	_, err = file.Write(certPem)
+	assert.NoError(t, err)
 
 	extraCertificateBytes, extraCertificateList, extraCertificateError := GetExtraCaCert(file.Name())
 	assert.Len(t, extraCertificateList, 1)
 	assert.NotEmpty(t, extraCertificateBytes)
-	assert.Nil(t, extraCertificateError)
-
-	// cleanup
-	os.Remove(file.Name())
+	assert.NoError(t, extraCertificateError)
 }
 
 func Test_AppendExtraCaCert_AddOneCert(t *testing.T) {
 	logger := log.Default()
-	extraCertPem, _, _ := MakeSelfSignedCert("mycert", []string{"dns"}, logger)
-	certPem, _, _ := MakeSelfSignedCert("mycert", []string{"dns"}, logger)
-	file, _ := os.CreateTemp("", "")
-	file.Write(extraCertPem)
+	extraCertPem, _, err := MakeSelfSignedCert("mycert", []string{"dns"}, logger)
+	assert.NoError(t, err)
+	certPem, _, err := MakeSelfSignedCert("mycert", []string{"dns"}, logger)
+	assert.NoError(t, err)
+	file, err := os.CreateTemp(t.TempDir(), "")
+	defer func() { _ = file.Close() }()
+	assert.NoError(t, err)
+	_, err = file.Write(extraCertPem)
+	assert.NoError(t, err)
 
 	certPem = AppendExtraCaCert(file.Name(), certPem)
 
 	certList, err := GetAllCerts(certPem)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	assert.Equal(t, 2, len(certList))
-
-	// cleanup
-	os.Remove(file.Name())
 }
 
 func Test_AppendExtraCaCert_AddNoCert(t *testing.T) {
 	logger := log.Default()
 	extraCertPem := "djalks"
-	certPem, _, _ := MakeSelfSignedCert("mycert", []string{"dns"}, logger)
-	file, _ := os.CreateTemp("", "")
-	file.Write([]byte(extraCertPem))
+	certPem, _, err := MakeSelfSignedCert("mycert", []string{"dns"}, logger)
+	assert.NoError(t, err)
+	file, err := os.CreateTemp(t.TempDir(), "")
+	defer func() { _ = file.Close() }()
+	assert.NoError(t, err)
+	_, err = file.Write([]byte(extraCertPem))
+	assert.NoError(t, err)
 
 	certPem = AppendExtraCaCert(file.Name(), certPem)
 
 	certList, err := GetAllCerts(certPem)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	assert.Equal(t, 1, len(certList))
-
-	// cleanup
-	os.Remove(file.Name())
 }
