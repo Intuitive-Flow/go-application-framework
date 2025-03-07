@@ -20,6 +20,10 @@ const ScanDoneEventSchema = `{
           "type": "string",
           "description": "The type of data (\"analytics\")."
         },
+		"path": {
+          "type": "string",
+          "description": "Path to the scanned folder."
+        },
         "attributes": {
           "type": "object",
           "required": [
@@ -133,30 +137,33 @@ const ScanDoneEventSchema = `{
 }
 `
 
+type UniqueIssueCount struct {
+	Critical int `json:"critical"`
+	High     int `json:"high"`
+	Medium   int `json:"medium"`
+	Low      int `json:"low"`
+}
+
 type ScanDoneEvent struct {
 	Data struct {
 		Type       string `json:"type"`
 		Attributes struct {
-			DeviceId                      string `json:"device_id"`
-			Application                   string `json:"application"`
-			ApplicationVersion            string `json:"application_version"`
-			Os                            string `json:"os"`
-			Arch                          string `json:"arch"`
-			IntegrationName               string `json:"integration_name"`
-			IntegrationVersion            string `json:"integration_version"`
-			IntegrationEnvironment        string `json:"integration_environment"`
-			IntegrationEnvironmentVersion string `json:"integration_environment_version"`
-			EventType                     string `json:"event_type"`
-			Status                        string `json:"status"`
-			ScanType                      string `json:"scan_type"`
-			UniqueIssueCount              struct {
-				Critical int `json:"critical"`
-				High     int `json:"high"`
-				Medium   int `json:"medium"`
-				Low      int `json:"low"`
-			} `json:"unique_issue_count"`
-			DurationMs        string    `json:"duration_ms"`
-			TimestampFinished time.Time `json:"timestamp_finished"`
+			DeviceId                      string           `json:"device_id"`
+			Application                   string           `json:"application"`
+			ApplicationVersion            string           `json:"application_version"`
+			Os                            string           `json:"os"`
+			Arch                          string           `json:"arch"`
+			IntegrationName               string           `json:"integration_name"`
+			IntegrationVersion            string           `json:"integration_version"`
+			IntegrationEnvironment        string           `json:"integration_environment"`
+			IntegrationEnvironmentVersion string           `json:"integration_environment_version"`
+			EventType                     string           `json:"event_type"`
+			Status                        string           `json:"status"`
+			ScanType                      string           `json:"scan_type"`
+			UniqueIssueCount              UniqueIssueCount `json:"unique_issue_count"`
+			DurationMs                    string           `json:"duration_ms"`
+			TimestampFinished             time.Time        `json:"timestamp_finished"`
+			Path                          string           `json:"path,omitempty"`
 		} `json:"attributes"`
 	} `json:"data"`
 }
